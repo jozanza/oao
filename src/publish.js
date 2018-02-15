@@ -63,7 +63,11 @@ const run = async ({
   _date,
   _masterVersion,
 }: Options) => {
+
+  // @todo - check to see if this command is being run with `yarn`
+
   const allSpecs = await readAllSpecs(src, ignoreSrc);
+  const pkgNames = Object.keys(allSpecs).filter(x => !allSpecs[x].specs.private)
 
   // Confirm that we have run build
   if (confirm) {
@@ -84,11 +88,11 @@ const run = async ({
 
   // Get last tag and find packages requiring updates
   const lastTag = await gitLastTag();
-  const dirty = await findPackagesToUpdate(allSpecs, lastTag, single);
-  if (!dirty.length) {
-    mainStory.info('No packages have been updated');
-    return;
-  }
+  // const dirty = await findPackagesToUpdate(allSpecs, lastTag, single);
+  // if (!dirty.length) {
+  //   mainStory.info('No packages have been updated');
+  //   return;
+  // }
 
   // Determine a suitable version number
   const masterVersion =
@@ -119,38 +123,59 @@ const run = async ({
         name: 'confirmPublish',
         type: 'confirm',
         message:
-          `Confirm release (${chalk.yellow.bold(dirty.length)} package/s, ` +
-          `v${chalk.cyan.bold(nextVersion)})?`,
+          `Confirm release (${chalk.yellow.bold(pkgNames.length)} package/s, ` +
+          `v${chalk.cyan.bold(nextVersion)})?${pkgNames.map(x => `\n• ${x}`).join('')}\n`,
         default: false,
       },
     ]);
     if (!confirmPublish) return;
   }
 
-  // Update package.json's for dirty packages AND THE ROOT PACKAGE + changelog
-  const dirtyPlusRoot = single ? dirty : dirty.concat(ROOT_PACKAGE);
-  for (let i = 0; i < dirtyPlusRoot.length; i++) {
-    const pkgName = dirtyPlusRoot[i];
-    const { specPath, specs } = allSpecs[pkgName];
-    specs.version = nextVersion;
-    writeSpecs(specPath, specs);
-  }
-  if (changelog) addVersionLine({ changelogPath, version: nextVersion, _date });
+  const { specPath: rootSpecPath, specs: rootSpecs } = allSpecs[ROOT_PACKAGE]
+  rootSpecs.version = nextVersion
+  writeSpecs(rootSpecPath, rootSpecs);
 
-  // Commit, tag and push
+  
+  // Commit...
   if (gitCommit) {
-    await gitCommitChanges(`v${nextVersion}`);
+    await gitCommitChanges(`"chore: v${nextVersion}"`);
+  }
+
+  if (changelog) {
+    await exec('npm -s run changelog')
+    await gitCommitChanges(`"docs: Updated changelog for v${nextVersion}"`)
+    addVersionLine({ changelogPath, version: nextVersion, _date });
+  }
+
+  // Tag and push
+  if (gitCommit) {
     await gitAddTag(`v${nextVersion}`);
     await gitPushWithTags();
   }
 
+  // Update package.json versions + cross-linked dependency versions
+  for (const pkgA of pkgNames) {
+    const { specPath: specPathA, specs: specsA } = allSpecs[pkgA];
+    mainStory.info(`Updating`, `${pkgA} ${specsA.version} -> ${nextVersion}`)
+    specsA.version = nextVersion;
+    if (!specsA.dependencies || specsA.private) continue
+    for (const pkgB of pkgNames) {
+      const { specPath: specPathB, specs: specsB } = allSpecs[pkgA];
+      if (specsA.dependencies[pkgB]) {
+        specsA.dependencies[pkgB] = nextVersion
+      }
+    }
+    writeSpecs(specPathA, specsA);
+  }
+
+
   // Publish
   if (npmPublish) {
-    for (let i = 0; i < dirty.length; i++) {
-      const pkgName = dirty[i];
+    for (const pkgName of pkgNames) {
       const { pkgPath, specs } = allSpecs[pkgName];
       if (specs.private) continue; // we don't want npm to complain :)
-      let cmd = 'npm publish';
+      // const cmd = 'npm pack'
+      let cmd = 'npm publish --access public';
       if (publishTag != null) cmd += ` --tag ${publishTag}`;
       await exec(cmd, { cwd: pkgPath });
     }
@@ -221,6 +246,7 @@ const findPackagesToUpdate = async (allSpecs, lastTag, single) => {
     const pkgName = pkgNames[i];
     if (pkgName === ROOT_PACKAGE && !single) continue;
     const { pkgPath, specs } = allSpecs[pkgName];
+    if (specs.private) continue;
     const diff = await gitDiffSinceIn(lastTag, pkgPath);
     if (diff !== '') {
       const numChanges = diff.split('\n').length;
